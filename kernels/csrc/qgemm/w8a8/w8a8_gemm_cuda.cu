@@ -11,6 +11,9 @@
 #include <cuda_pipeline_primitives.h>
 #include <torch/extension.h>
 
+#include "../../dispatch_utils.h"
+#include "../../utils.cuh"
+
 #define OP_M 16
 #define OP_N 8
 #define OP_K 32
@@ -26,31 +29,31 @@
 #else
 #define L2_CACHEHINT(size)
 #endif
-#define KERNEL_LAUNCH_CODE                                                       \
+#define KERNEL_LAUNCH_CODE                                                          \
   constexpr int NUM_WARPS = (CTA_M / WARP_M) * (CTA_N / WARP_N) * (CTA_K / WARP_K); \
-  constexpr int kSmemByteSize =                                                  \
-      (CTA_M * (CTA_K + SMEM_PAD_A) + CTA_N * (CTA_K + SMEM_PAD_B)) * STAGES *   \
-      sizeof(int8_t);                                                            \
-  if (kSmemByteSize >= 99 * 1024)                                                \
-  {                                                                              \
-    printf("This kernel requires %d Bytes of shared memory, which exceeds "      \
-           "device limit.\n",                                                    \
-           kSmemByteSize);                                                       \
-    return ;                                                           \
-  }                                                                              \
-  int num_blocks_m = (num_out_feats + CTA_M - 1) / CTA_M;                        \
-  int num_blocks_n = num_out_channels / CTA_N / 1;                               \
-  const int log_tile = get_log_tile<8>((num_out_feats + CTA_M - 1) / CTA_M);     \
-  const int tile_shift = 1 << log_tile;                                          \
-  dim3 num_blocks(num_blocks_n *tile_shift,                                      \
-                  (num_blocks_m + tile_shift - 1) / tile_shift);                 \
-  dim3 threads_per_block(WARP_SIZE, NUM_WARPS);                                  \
-  auto kernel_func =                                                             \
-      dense_kernel0<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES>;        \
-  cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, \
-                       kSmemByteSize);                                           \
-  kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(                 \
-      in_feats, kernel, wscales, ascales, out_feats, num_in_feats, num_out_channels,               \
+  constexpr int kSmemByteSize =                                                     \
+      (CTA_M * (CTA_K + SMEM_PAD_A) + CTA_N * (CTA_K + SMEM_PAD_B)) * STAGES *      \
+      sizeof(int8_t);                                                               \
+  if (kSmemByteSize >= 99 * 1024)                                                   \
+  {                                                                                 \
+    printf("This kernel requires %d Bytes of shared memory, which exceeds "         \
+           "device limit.\n",                                                       \
+           kSmemByteSize);                                                          \
+    return ;                                                                   \
+  }                                                                                 \
+  int num_blocks_m = (num_out_feats + CTA_M - 1) / CTA_M;                           \
+  int num_blocks_n = num_out_channels / CTA_N / 1;                                  \
+  const int log_tile = get_log_tile<8>((num_out_feats + CTA_M - 1) / CTA_M);        \
+  const int tile_shift = 1 << log_tile;                                             \
+  dim3 num_blocks(num_blocks_n *tile_shift,                                         \
+                  (num_blocks_m + tile_shift - 1) / tile_shift);                    \
+  dim3 threads_per_block(WARP_SIZE, NUM_WARPS);                                     \
+  auto kernel_func =                                                                \
+      dense_kernel0<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, T, T2>;    \
+  cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize,    \
+                       kSmemByteSize);                                              \
+  kernel_func<<<num_blocks, threads_per_block, kSmemByteSize, stream>>>(            \
+      in_feats, kernel, wscales, ascales, out_feats, num_in_feats, num_out_channels,\
       num_in_channels);
 
 template <int N>
@@ -147,7 +150,7 @@ __device__ __inline__ void mma_m16n8k32(void *C_warp, void *A_shared_warp,
 template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int SHARED_K_ITERS,
           int STAGES>
 __device__ __inline__ void
-global_to_share_one_stage_A(int8_t *src, int8_t *dst, int global_ncols,
+global_to_share_one_stage_A(const int8_t *src, int8_t *dst, int global_ncols,
                             int cta_offset_m, int cta_offset_n,
                             int global_iter_k, int shared_iter_k, bool mask,
                             bool *preds)
@@ -158,8 +161,8 @@ global_to_share_one_stage_A(int8_t *src, int8_t *dst, int global_ncols,
   constexpr int warp_step_m_or_n = (WARP_SIZE * PACK_SIZE) / CTA_K;
   constexpr int threads_per_row = CTA_K / PACK_SIZE;
   constexpr int kSmemCol = CTA_K + SMEM_PAD_A;
-  int8_t *dst_hoisted = dst;
-  int8_t *src_hoisted = src + global_iter_k * CTA_K;
+  const int8_t *dst_hoisted = dst;
+  const int8_t *src_hoisted = src + global_iter_k * CTA_K;
 
   if (mask)
   {
@@ -190,7 +193,7 @@ global_to_share_one_stage_A(int8_t *src, int8_t *dst, int global_ncols,
 template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int SHARED_K_ITERS,
           int STAGES>
 __device__ __inline__ void
-global_to_share_one_stage_B(int8_t *src, int8_t *dst, int global_ncols,
+global_to_share_one_stage_B(const int8_t *src, int8_t *dst, int global_ncols,
                             int cta_offset_m, int cta_offset_n,
                             int global_iter_k, int shared_iter_k, bool mask)
 {
@@ -201,7 +204,7 @@ global_to_share_one_stage_B(int8_t *src, int8_t *dst, int global_ncols,
   constexpr int threads_per_row = CTA_K / PACK_SIZE;
   constexpr int kSmemCol = CTA_K + SMEM_PAD_B;
   int8_t *dst_hoisted = dst;
-  int8_t *src_hoisted = src + global_iter_k * CTA_K;
+  const int8_t *src_hoisted = src + global_iter_k * CTA_K;
 
 #pragma unroll
   for (int _global_iter = 0; _global_iter < partial_global_iters;
@@ -265,10 +268,10 @@ share_to_reg_one_stage_B(int8_t *src, int8_t *dst, int warp_offset_m,
 }
 
 template <int CTA_M, int CTA_N, int CTA_K, int WARP_M, int WARP_N, int WARP_K,
-          int STAGES>
-__global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
-                              half2 *__restrict__ wscales, half *__restrict__ ascales,
-                              half *__restrict__ C, int M, int N, int K)
+          int STAGES, typename T, typename T2>
+__global__ void dense_kernel0(const int8_t *__restrict__ A, const int8_t *__restrict__ B,
+                              const T2 *__restrict__ wscales, const T *__restrict__ ascales,
+                              T *__restrict__ C, int M, int N, int K)
 {
   constexpr int NUM_WARPS_MN = CTA_M / WARP_M * CTA_N / WARP_N;
   constexpr int NUM_WARPS = NUM_WARPS_MN * CTA_K / WARP_K;
@@ -336,9 +339,9 @@ __global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
                              A_hoisted_col_swizzled * PACK_SIZE;
   int8_t *B_shared_hoisted = B_shared + B_hoisted_row * kSmemPadKB +
                              B_hoisted_col_swizzled * PACK_SIZE;
-  int8_t *A_hoisted = A + cta_offset_m * K + A_hoisted_row * K +
+  const int8_t *A_hoisted = A + cta_offset_m * K + A_hoisted_row * K +
                       A_hoisted_col * PACK_SIZE;
-  int8_t *B_hoisted = B + cta_offset_n * K + B_hoisted_row * K +
+  const int8_t *B_hoisted = B + cta_offset_n * K + B_hoisted_row * K +
                       B_hoisted_col * PACK_SIZE;
   bool A_g2s_preds[A_total_global_iters];
 #pragma unroll
@@ -516,12 +519,12 @@ __global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
           int row_wb = row_wb_1 + (local_id % 4) / 2 * 8;
           if (row_wb < M){
             int col_wb = col_wb_1 + (local_id / 4) * 8 + (local_id % 2);
-            float2 wscale = __half22float2(*(wscales + col_wb / 2));
-            float ascale = __half2float(ascales[row_wb]);
+            float2 wscale = to_float2(*(wscales + col_wb / 2));
+            float ascale = to_float(ascales[row_wb]);
             float2 psums = make_float2(__int2float_rn(C_warp_local[local_id]), __int2float_rn(C_warp_local[local_id + 1]));
             psums.x *= wscale.x * ascale;
             psums.y *= wscale.y * ascale;
-            *reinterpret_cast<half2 *>(C + row_wb * N + col_wb) = __float22half2_rn(psums);
+            *reinterpret_cast<T2 *>(C + row_wb * N + col_wb) = from_float2<T2>(psums);
           }
         };
       }
@@ -529,27 +532,23 @@ __global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
   }
 }
 
-void w8a8_gemm_forward_cuda(torch::Tensor _in_feats,
-                                torch::Tensor _kernel,
-                                torch::Tensor _wscales,
-                                torch::Tensor _ascales,
-                                torch::Tensor _out_feats)
-{
-  int num_in_feats = _in_feats.size(0);
-  int num_in_channels = _in_feats.size(1);
-  auto in_feats = reinterpret_cast<int8_t *>(_in_feats.data_ptr<int8_t>());
-  auto kernel = reinterpret_cast<int8_t *>(_kernel.data_ptr<int8_t>());
-  auto wscales = reinterpret_cast<half2 *>(_wscales.data_ptr());
-  auto ascales = reinterpret_cast<half *>(_ascales.data_ptr());
-  // auto options =
-  //     torch::TensorOptions().dtype(torch::kFloat16).device(_in_feats.device());
-  // at::Tensor _out_feats =
-  //     torch::empty({num_in_feats, _kernel.size(0)}, options);
-  int num_out_feats = _out_feats.size(-2);
-  int num_out_channels = _out_feats.size(-1);
-
-
-  auto out_feats = reinterpret_cast<half *>(_out_feats.data_ptr<at::Half>());
+template <typename T>
+void gemm_w8a8_cuda(int num_in_feats,
+                    int num_in_channels,
+                    int num_out_feats,
+                    int num_out_channels,
+                    const int8_t* in_feats_ptr,
+                    const int8_t* kernel_ptr,
+                    const T* wscales_ptr,
+                    const T* ascales_ptr,
+                    T* out_ptr,
+                    cudaStream_t stream) {
+  using T2 = typename packed_as<T, 2>::type;
+  auto in_feats = reinterpret_cast<const int8_t *>(in_feats_ptr);
+  auto kernel = reinterpret_cast<const int8_t *>(kernel_ptr);
+  auto wscales = reinterpret_cast<const T2 *>(wscales_ptr);
+  auto ascales = reinterpret_cast<const T *>(ascales_ptr);
+  auto out_feats = reinterpret_cast<T *>(out_ptr);
 
   if (num_out_feats > 128)
   {
@@ -576,3 +575,54 @@ void w8a8_gemm_forward_cuda(torch::Tensor _in_feats,
   return ;
 }
 
+void w8a8_gemm_forward_cuda(torch::Tensor _in_feats,
+                            torch::Tensor _kernel,
+                            torch::Tensor _wscales,
+                            torch::Tensor _ascales,
+                            torch::Tensor _out_feats)
+{
+  int num_in_feats = _in_feats.size(0);
+  int num_in_channels = _in_feats.size(1);
+  int num_out_feats = _out_feats.size(-2);
+  int num_out_channels = _out_feats.size(-1);
+
+  int8_t* in_feats = reinterpret_cast<int8_t *>(_in_feats.data_ptr<int8_t>());
+  int8_t* kernel = reinterpret_cast<int8_t *>(_kernel.data_ptr<int8_t>());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  if (_wscales.scalar_type() == at::kHalf) {
+    using scalar_t = at::Half;
+    using T = typename FloatTypeConverter<scalar_t>::Type;
+    auto wscales = reinterpret_cast<T *>(_wscales.data_ptr<scalar_t>());
+    auto ascales = reinterpret_cast<T *>(_ascales.data_ptr<scalar_t>());
+    auto out_feats = reinterpret_cast<T *>(_out_feats.data_ptr<scalar_t>());
+    return gemm_w8a8_cuda<half>(num_in_feats,
+                                num_in_channels,
+                                num_out_feats,
+                                num_out_channels,
+                                in_feats,
+                                kernel,
+                                wscales,
+                                ascales,
+                                out_feats,
+                                stream);
+  } else if (_wscales.scalar_type() == at::kBFloat16) {
+#ifdef ENABLE_BF16
+    using scalar_t = at::BFloat16;
+    using T = typename FloatTypeConverter<scalar_t>::Type;
+    auto wscales = reinterpret_cast<T *>(_wscales.data_ptr<scalar_t>());
+    auto ascales = reinterpret_cast<T *>(_ascales.data_ptr<scalar_t>());
+    auto out_feats = reinterpret_cast<T *>(_out_feats.data_ptr<scalar_t>());
+    return gemm_w8a8_cuda<nv_bfloat16>(num_in_feats,
+                                       num_in_channels,
+                                       num_out_feats,
+                                       num_out_channels,
+                                       in_feats,
+                                       kernel,
+                                       wscales,
+                                       ascales,
+                                       out_feats,
+                                       stream);
+#endif
+  }
+}

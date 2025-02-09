@@ -10,6 +10,7 @@
 #include <torch/extension.h>
 
 #include "dispatch_utils.h"
+
 #include "utils.cuh"
 #include "reduction_utils.cuh"
 
@@ -134,7 +135,7 @@ __global__ void generalLayerNorm(const T* input, const T* gamma, const T* beta, 
     const bool with_per_token_scaling = scale_orig_quant_per_token != nullptr;
     const bool with_per_tensor_scaling = scale_orig_quant_per_tensor != nullptr;
     const float_packed_t scale_orig_quant
-        = cuda_cast<float_packed_t>(with_per_tensor_scaling ? __half2float(*scale_orig_quant_per_tensor) : 0.0f);
+        = cuda_cast<float_packed_t>(with_per_tensor_scaling ? to_float(*scale_orig_quant_per_tensor) : 0.0f);
     T_scalar amax = 1e-6f;
 
     for (int i = tidx; i < n_elems; i += blockDim.x)
@@ -270,9 +271,11 @@ __global__ void generalLayerNorm_fuse_sum(const T* input, const T* gamma, const 
     const bool with_per_token_scaling = scale_orig_quant_per_token != nullptr;
     const bool with_per_tensor_scaling = scale_orig_quant_per_tensor != nullptr;
     const float_packed_t scale_orig_quant
-        = cuda_cast<float_packed_t>(with_per_tensor_scaling ? __half2float(*scale_orig_quant_per_tensor) : 0.0f);
+        = cuda_cast<float_packed_t>(with_per_tensor_scaling ? to_float(*scale_orig_quant_per_tensor) : 0.0f);
     T_scalar amax = 1e-6f;
-    T_scalar sum = 0.0f;
+    // It is better to use float for sum.
+    // T_scalar sum = 0.0f;
+    float sum = 0.0f;
 
     for (int i = tidx; i < n_elems; i += blockDim.x)
     {
@@ -303,7 +306,7 @@ __global__ void generalLayerNorm_fuse_sum(const T* input, const T* gamma, const 
     if (with_per_token_scaling)
     {
         float abs_max_f = blockAllReduceMax(cuda_cast<float>(amax));
-        float sum_f = blockAllReduceSum(cuda_cast<float>(sum));
+        float sum_f = blockAllReduceSum(sum);
         const float dynamic_per_token_scale = 127.f / abs_max_f;
         for (int i = tidx; i < n_elems; i += blockDim.x)
         {
@@ -316,11 +319,13 @@ __global__ void generalLayerNorm_fuse_sum(const T* input, const T* gamma, const 
 
             reinterpret_cast<int8_packed_t*>(normed_output_quant)[index]
                 = cuda_cast<int8_packed_t>(val_f * cuda_cast<float_packed_t>(dynamic_per_token_scale));
+            // For debug: output unquantized result.
+            // reinterpret_cast<T*>(normed_output_quant)[index] = cuda_cast<T>(val_f);
         }
         if (tidx == 0)
         {
             scale_orig_quant_per_token[bidx] = abs_max_f / 127.f;
-            input_sum[bidx] = sum_f;
+            input_sum[bidx] = from_float<scale_type>(sum_f);
         }
     }
 }
@@ -441,10 +446,10 @@ void rms_norm_general(torch::Tensor &out,    // [..., hidden_size]
     using T = typename FloatTypeConverter<scalar_t>::Type;
     if (use_per_token_quant) {
       // per-token
-      vllm::generalLayerNorm<T, at::Half><<<grid, block, 0, stream>>>(
+      vllm::generalLayerNorm<T, T><<<grid, block, 0, stream>>>(
         reinterpret_cast<T*>(input.data_ptr<scalar_t>()), 
         reinterpret_cast<T*>(weight.data_ptr<scalar_t>()), nullptr,
-        nullptr, epsilon, num_tokens, hidden_size, nullptr, scaling.data_ptr<at::Half>(),
+        nullptr, epsilon, num_tokens, hidden_size, nullptr, reinterpret_cast<T*>(scaling.data_ptr<scalar_t>()),
         out.data_ptr<int8_t>(), false
       );
       // input, gamma, beta, normed_output, eps, tokens, hidden_dim, per_tensor_scale, per_token_scale
@@ -453,10 +458,10 @@ void rms_norm_general(torch::Tensor &out,    // [..., hidden_size]
         // weight.data_ptr<scalar_t>(), epsilon, num_tokens, hidden_size);
     } else {
       // per-tensor
-      vllm::generalLayerNorm<T, at::Half><<<grid, block, 0, stream>>>(
+      vllm::generalLayerNorm<T, T><<<grid, block, 0, stream>>>(
         reinterpret_cast<T*>(input.data_ptr<scalar_t>()), 
         reinterpret_cast<T*>(weight.data_ptr<scalar_t>()), nullptr,
-        nullptr, epsilon, num_tokens, hidden_size, scaling.data_ptr<at::Half>(), nullptr,
+        nullptr, epsilon, num_tokens, hidden_size, reinterpret_cast<T*>(scaling.data_ptr<scalar_t>()), nullptr,
         out.data_ptr<int8_t>(), false
       );
     }
@@ -481,11 +486,11 @@ void rms_norm_general_fuse_sum(torch::Tensor &out,    // [..., hidden_size]
     using T = typename FloatTypeConverter<scalar_t>::Type;
     if (use_per_token_quant) {
       // per-token
-      vllm::generalLayerNorm_fuse_sum<T, at::Half><<<grid, block, 0, stream>>>(
+      vllm::generalLayerNorm_fuse_sum<T, T><<<grid, block, 0, stream>>>(
         reinterpret_cast<T*>(input.data_ptr<scalar_t>()), 
         reinterpret_cast<T*>(weight.data_ptr<scalar_t>()), nullptr,
-        nullptr, epsilon, num_tokens, hidden_size, input_sum.data_ptr<at::Half>(), nullptr, scaling.data_ptr<at::Half>(),
-        out.data_ptr<int8_t>(), false
+        nullptr, epsilon, num_tokens, hidden_size, reinterpret_cast<T*>(input_sum.data_ptr<scalar_t>()),
+        nullptr, reinterpret_cast<T*>(scaling.data_ptr<scalar_t>()), out.data_ptr<int8_t>(), false
       );
       // input, gamma, beta, normed_output, eps, tokens, hidden_dim, per_tensor_scale, per_token_scale
       // normed_output_quant, use_shmem
@@ -497,10 +502,10 @@ void rms_norm_general_fuse_sum(torch::Tensor &out,    // [..., hidden_size]
       // Not implemented per-tensor input_sum
       assert(false);
       
-      vllm::generalLayerNorm_fuse_sum<T, at::Half><<<grid, block, 0, stream>>>(
+      vllm::generalLayerNorm_fuse_sum<T, T><<<grid, block, 0, stream>>>(
         reinterpret_cast<T*>(input.data_ptr<scalar_t>()), 
         reinterpret_cast<T*>(weight.data_ptr<scalar_t>()), nullptr,
-        nullptr, epsilon, num_tokens, hidden_size, nullptr, scaling.data_ptr<at::Half>(), nullptr,
+        nullptr, epsilon, num_tokens, hidden_size, nullptr, reinterpret_cast<T*>(scaling.data_ptr<scalar_t>()), nullptr,
         out.data_ptr<int8_t>(), false
       );
     }

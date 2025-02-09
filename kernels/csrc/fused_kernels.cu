@@ -27,11 +27,11 @@ __global__ void dequant_add_residual_kernel(const int32_t *__restrict__ input,
   for (int i = tid; i < hidden_size; i += blockDim.x) {
     if constexpr (use_per_token_dequant) {
       output[token_idx * hidden_size + i] =
-          (T)((((float)input[token_idx * hidden_size + i]) * __half2float(scale[token_idx])) +
+          (T)((((float)input[token_idx * hidden_size + i]) * to_float(scale[token_idx])) +
               (float)residual[token_idx * hidden_size + i]);
     } else {
       output[token_idx * hidden_size + i] =
-          (T)((((float)input[token_idx * hidden_size + i]) * __half2float(scale)) +
+          (T)((((float)input[token_idx * hidden_size + i]) * to_float(scale)) +
               (float)residual[token_idx * hidden_size + i]);
     }
   }
@@ -39,13 +39,13 @@ __global__ void dequant_add_residual_kernel(const int32_t *__restrict__ input,
 
 template <typename T>
 __global__ void dequant_kernel(const int32_t *__restrict__ input,
-                               T *__restrict__ output, const at::Half scale, int m,
+                               T *__restrict__ output, half scale, int m,
                                int hidden_size, int input_stride, int out_stride) {
   const int tid = threadIdx.x;
   const int token_idx = blockIdx.x;
   for (int i = tid; i < hidden_size; i += blockDim.x) {
     output[token_idx * out_stride + i] =
-        (T)(((float)input[token_idx * input_stride + i]) * __half2float(scale));
+        (T)(((float)input[token_idx * input_stride + i]) * to_float(scale));
   }
 }
 
@@ -71,7 +71,7 @@ __global__ void quant_kernel(const T *__restrict__ input,
     const float block_amax_val = blockReduceMax(amax_val);
     if (tid == 0) {
       s_amax = block_amax_val;
-      scale[token_idx] = __float2half_rn(block_amax_val / 127.0f);
+      scale[token_idx] = from_float<T>(block_amax_val / 127.0f);
     }
     __syncthreads();
 
@@ -83,7 +83,7 @@ __global__ void quant_kernel(const T *__restrict__ input,
   } else {
     for (int i = tid; i < hidden_size; i += blockDim.x) {
       output[token_idx * hidden_size + i] =
-          float_to_int8_rn(((float)input[token_idx * hidden_size + i]) / __half2float(scale));
+          float_to_int8_rn(((float)input[token_idx * hidden_size + i]) / to_float(scale));
     }
   }
 }
@@ -91,10 +91,11 @@ __global__ void quant_kernel(const T *__restrict__ input,
 
 template <typename T, typename scale_type, bool use_per_token_quant>
 __global__ void quant_kernel_fuse_sum(const T *__restrict__ input,
-                             int8_t *__restrict__ output, 
-                             scale_type input_sum, 
-                             scale_type scale,
-                             int num_tokens, int hidden_size) {
+                                      int8_t *__restrict__ output,
+                                      scale_type input_sum,
+                                      scale_type scale,
+                                      int num_tokens,
+                                      int hidden_size) {
   // TODO: get the sum here.
   const int tid = threadIdx.x;
   const int token_idx = blockIdx.x;
@@ -118,8 +119,8 @@ __global__ void quant_kernel_fuse_sum(const T *__restrict__ input,
     const float block_sum_val = blockReduceSum(sum_val);
     if (tid == 0) {
       s_amax = block_amax_val;
-      scale[token_idx] = __float2half_rn(block_amax_val / 127.0f);
-      input_sum[token_idx] = __float2half_rn(block_sum_val);
+      scale[token_idx] = from_float<T>(block_amax_val / 127.0f);
+      input_sum[token_idx] = from_float<T>(block_sum_val);
     }
     __syncthreads();
 
@@ -131,7 +132,7 @@ __global__ void quant_kernel_fuse_sum(const T *__restrict__ input,
   } else {
     for (int i = tid; i < hidden_size; i += blockDim.x) {
       output[token_idx_mul_hidden_size + i] =
-          float_to_int8_rn(((float)input[token_idx_mul_hidden_size + i]) / __half2float(scale));
+          float_to_int8_rn(((float)input[token_idx_mul_hidden_size + i]) / to_float(scale));
     }
   }
 }
@@ -205,8 +206,10 @@ void invoke_quant(torch::Tensor &out,   // [..., hidden_size]
   dim3 block(std::min(hidden_size, 1024));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "quant_kernel", [&] {
-    vllm::quant_kernel<scalar_t, at::Half, false><<<grid, block, 0, stream>>>(
-        input.data_ptr<scalar_t>(), out.data_ptr<int8_t>(), scale, num_tokens, hidden_size);
+    // It look like this function is never called. We hard code the template to half since input argument scale is at::Half.
+    // using T = typename FloatTypeConverter<scalar_t>::Type;
+    vllm::quant_kernel<half, half, false><<<grid, block, 0, stream>>>(
+        reinterpret_cast<half*>(input.data_ptr<scalar_t>()), out.data_ptr<int8_t>(), scale, num_tokens, hidden_size);
   });
 }
 
@@ -221,9 +224,10 @@ void invoke_quant(torch::Tensor &out,   // [..., hidden_size]
   dim3 block(std::min(hidden_size, 1024));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "quant_kernel", [&] {
-    vllm::quant_kernel<scalar_t, at::Half *, true><<<grid, block, 0, stream>>>(
-        input.data_ptr<scalar_t>(), out.data_ptr<int8_t>(),
-        scale.data_ptr<at::Half>(), num_tokens, hidden_size);
+    using T = typename FloatTypeConverter<scalar_t>::Type;
+    vllm::quant_kernel<T, T *, true><<<grid, block, 0, stream>>>(
+        reinterpret_cast<T*>(input.data_ptr<scalar_t>()), out.data_ptr<int8_t>(),
+        reinterpret_cast<T*>(scale.data_ptr<scalar_t>()), num_tokens, hidden_size);
   });
 }
 
@@ -259,8 +263,9 @@ void invoke_quant_fuse_sum(torch::Tensor &out,   // [..., hidden_size]
   dim3 block(std::min(hidden_size, 1024));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "quant_kernel_fuse_sum", [&] {
-    vllm::quant_kernel_fuse_sum<scalar_t, at::Half *, true><<<grid, block, 0, stream>>>(
-        input.data_ptr<scalar_t>(), out.data_ptr<int8_t>(), input_sum.data_ptr<at::Half>(),
-        scale.data_ptr<at::Half>(), num_tokens, hidden_size);
+    using T = typename FloatTypeConverter<scalar_t>::Type;
+    vllm::quant_kernel_fuse_sum<T, T*, true><<<grid, block, 0, stream>>>(
+        reinterpret_cast<T*>(input.data_ptr<scalar_t>()), out.data_ptr<int8_t>(), reinterpret_cast<T*>(input_sum.data_ptr<scalar_t>()),
+        reinterpret_cast<T*>(scale.data_ptr<scalar_t>()), num_tokens, hidden_size);
   });
 }

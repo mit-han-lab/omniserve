@@ -11,6 +11,9 @@
 #include <cuda_pipeline_primitives.h>
 #include <torch/extension.h>
 
+#include "../../dispatch_utils.h"
+#include "../../utils.cuh"
+
 #define OP_M 16
 #define OP_N 8
 #define OP_K 32
@@ -37,7 +40,7 @@
     printf("This kernel requires %d Bytes of shared memory, which exceeds "                                  \
            "device limit.\n",                                                                                \
            kSmemByteSize);                                                                                   \
-    return ;                                                                                       \
+    return ;                                                                                                 \
   }                                                                                                          \
   int num_blocks_m = (num_out_feats + CTA_M - 1) / CTA_M;                                                    \
   int num_blocks_n = num_out_channels / CTA_N / 1;                                                           \
@@ -47,11 +50,11 @@
                   (num_blocks_m + tile_shift - 1) / tile_shift);                                             \
   dim3 threads_per_block(WARP_SIZE, NUM_WARPS);                                                              \
   auto kernel_func =                                                                                         \
-      dense_kernel0<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;                                 \
+      dense_kernel0<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G, T, T2>;                          \
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize,                             \
                        kSmemByteSize);                                                                       \
-  kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(                                             \
-      in_feats, kernel, wscales, ascales, w_szs, a_ssums, out_feats, num_in_feats, num_out_channels,       \
+  kernel_func<<<num_blocks, threads_per_block, kSmemByteSize, stream>>>(                                     \
+      in_feats, kernel, wscales, ascales, w_szs, a_ssums, out_feats, num_in_feats, num_out_channels,         \
        num_in_channels);
 
 template <int N>
@@ -127,8 +130,8 @@ cp_async_cg_A(uint32_t smem_int_ptr, const uint4 *__restrict__ src, bool mask)
                 "n"(cp_size));
 }
 
-__device__ __inline__ void mma_m16n8k32(void *C_warp, void *A_shared_warp,
-                                        void *B_shared_warp)
+__device__ __inline__ void mma_m16n8k32(void *C_warp, const void *A_shared_warp,
+                                        const void *B_shared_warp)
 {
   __asm__ __volatile__(
       "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32"
@@ -148,7 +151,7 @@ __device__ __inline__ void mma_m16n8k32(void *C_warp, void *A_shared_warp,
 template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int SHARED_K_ITERS,
           int STAGES>
 __device__ __inline__ void
-global_to_share_one_stage_A(int8_t *src, int8_t *dst, int global_ncols,
+global_to_share_one_stage_A(const int8_t *src, int8_t *dst, int global_ncols,
                             int cta_offset_m, int cta_offset_n,
                             int global_iter_k, int shared_iter_k, bool mask,
                             bool *preds)
@@ -160,7 +163,7 @@ global_to_share_one_stage_A(int8_t *src, int8_t *dst, int global_ncols,
   constexpr int threads_per_row = CTA_K / PACK_SIZE;
   constexpr int kSmemCol = CTA_K + SMEM_PAD_A;
   int8_t *dst_hoisted = dst;
-  int8_t *src_hoisted = src + global_iter_k * CTA_K;
+  const int8_t *src_hoisted = src + global_iter_k * CTA_K;
 
   if (mask)
   {
@@ -194,7 +197,7 @@ global_to_share_one_stage_A(int8_t *src, int8_t *dst, int global_ncols,
 template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int SHARED_K_ITERS,
           int STAGES>
 __device__ __inline__ void
-global_to_share_one_stage_B(int8_t *src, int8_t *dst, int global_ncols,
+global_to_share_one_stage_B(const int8_t *src, int8_t *dst, int global_ncols,
                             int cta_offset_m, int cta_offset_n,
                             int global_iter_k, int shared_iter_k, bool mask)
 {
@@ -204,7 +207,7 @@ global_to_share_one_stage_B(int8_t *src, int8_t *dst, int global_ncols,
   constexpr int cta_step_m_or_n = NUM_WARPS / warps_per_row;
   constexpr int kSmemCol = CTA_K;
   int8_t *dst_hoisted = dst;
-  int8_t *src_hoisted = src + global_iter_k * CTA_K * PACK_SIZE;
+  const int8_t *src_hoisted = src + global_iter_k * CTA_K * PACK_SIZE;
 
 #pragma unroll
   for (int global_iter = 0; global_iter < total_global_iters; ++global_iter)
@@ -228,7 +231,7 @@ global_to_share_one_stage_B(int8_t *src, int8_t *dst, int global_ncols,
 
 
 template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int STAGES, int G>
-__device__ __inline__ void global_to_share_one_stage_zeros(int8_t *src, int8_t *dst, int global_ncols, int cta_offset_m, int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
+__device__ __inline__ void global_to_share_one_stage_zeros(const int8_t *src, int8_t *dst, int global_ncols, int cta_offset_m, int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
 {
   constexpr int threads_needed = CTA_N / PACK_SIZE / 1;
   constexpr int threads_used = threads_needed < CTA_SIZE ? threads_needed : CTA_SIZE;
@@ -256,7 +259,7 @@ __device__ __inline__ void global_to_share_one_stage_zeros(int8_t *src, int8_t *
 
 template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int STAGES>
 __device__ __inline__ void
-share_to_reg_one_stage_A(int8_t *src, int8_t *dst, int warp_offset_m,
+share_to_reg_one_stage_A(const int8_t *src, int8_t *dst, int warp_offset_m,
                          int warp_offset_n, int k_0_1, int shared_iters)
 {
   constexpr int kSmemCol = CTA_K + SMEM_PAD_A;
@@ -301,11 +304,11 @@ share_to_reg_one_stage_B(int8_t *src, int8_t *dst, int8_t *zeros, int8_t *scales
 }
 
 template <int CTA_M, int CTA_N, int CTA_K, int WARP_M, int WARP_N, int WARP_K,
-          int STAGES, int G>
-__global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
-                              half2 *__restrict__ wscales, half *__restrict__ ascales,
-                              half2 *__restrict__ w_szs, half *__restrict__ a_ssums,
-                              half *__restrict__ C, int M, int64_t N, int64_t K)
+          int STAGES, int G, typename T, typename T2>
+__global__ void dense_kernel0(const int8_t *__restrict__ A, const int8_t *__restrict__ B,
+                              const T2 *__restrict__ wscales, const T *__restrict__ ascales,
+                              const T2 *__restrict__ w_szs, const T *__restrict__ a_ssums,
+                              T *__restrict__ C, int M, int64_t N, int64_t K)
 {
   constexpr int SPLITK = 1;
   constexpr int NUM_WARPS_MN = CTA_M / WARP_M * CTA_N / WARP_N;
@@ -383,9 +386,9 @@ __global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
       B_shared + (threadIdx.y % B_warps_per_row) * 32 * PACK_SIZE +
       (threadIdx.y / B_warps_per_row) * kSmemPadKB * PACK_SIZE +
       threadIdx.x * PACK_SIZE;
-  int8_t *A_hoisted = A + cta_offset_m * K + A_hoisted_row * K + 
+  const int8_t *A_hoisted = A + cta_offset_m * K + A_hoisted_row * K + 
                       A_hoisted_col * PACK_SIZE;
-  int8_t *B_hoisted = B + cta_offset_n / 32 * K * PACK_SIZE +
+  const int8_t *B_hoisted = B + cta_offset_n / 32 * K * PACK_SIZE +
                       (threadIdx.y % B_warps_per_row) * 32 * PACK_SIZE +
                       (threadIdx.y / B_warps_per_row) * K * PACK_SIZE +
                       threadIdx.x * PACK_SIZE;
@@ -578,14 +581,14 @@ __global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
           if (row_wb < M)
           {
             int col_wb = col_wb_1 + (local_id / 4) * 8 + (local_id % 2);
-            float2 wscale = __half22float2(*(wscales + col_wb / 2));
-            float2 w_sz = __half22float2(*(w_szs + col_wb / 2));
-            float ascale = __half2float(ascales[row_wb]);
-            float a_ssum = __half2float(a_ssums[row_wb]);
+            float2 wscale = to_float2(*(wscales + col_wb / 2));
+            float2 w_sz = to_float2(*(w_szs + col_wb / 2));
+            float ascale = to_float(ascales[row_wb]);
+            float a_ssum = to_float(a_ssums[row_wb]);
             float2 psums = make_float2(__int2float_rn(C_warp_local[local_id]), __int2float_rn(C_warp_local[local_id + 1]));
             psums.x = psums.x * wscale.x * ascale - w_sz.x * a_ssum;
             psums.y = psums.y * wscale.y * ascale - w_sz.y * a_ssum;
-            *reinterpret_cast<half2 *>(C + row_wb * N + col_wb) = __float22half2_rn(psums);
+            *reinterpret_cast<T2 *>(C + row_wb * N + col_wb) = from_float2<T2>(psums);
           }
         };
       }
@@ -593,25 +596,24 @@ __global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
   }
 }
 
-void gemm_forward_cuda(torch::Tensor _in_feats,
-                        torch::Tensor _kernel,
-                        torch::Tensor _wscales,
-                        torch::Tensor _ascales,
-                        torch::Tensor _w_szs,
-                        torch::Tensor _a_ssums,
-                        torch::Tensor _out_feats)
-{
-  int num_in_feats = _in_feats.size(0);
-  int num_in_channels = _in_feats.size(1);
-  auto in_feats = reinterpret_cast<int8_t *>(_in_feats.data_ptr<int8_t>());
-  auto kernel = reinterpret_cast<int8_t *>(_kernel.data_ptr<int8_t>());
-  auto w_szs = reinterpret_cast<half2 *>(_w_szs.data_ptr());
-  auto a_ssums = reinterpret_cast<half *>(_a_ssums.data_ptr());
-  auto wscales = reinterpret_cast<half2 *>(_wscales.data_ptr());
-  auto ascales = reinterpret_cast<half *>(_ascales.data_ptr());
-  int num_out_feats = _out_feats.size(-2);
-  int num_out_channels = _out_feats.size(-1);
-  auto out_feats = reinterpret_cast<half *>(_out_feats.data_ptr<at::Half>());
+template <typename T>
+void gemm_w4a8_per_chn(int num_in_feats,
+                       int num_in_channels,
+                       int num_out_feats,
+                       int num_out_channels,
+                       const int8_t* in_feats_ptr,
+                       const int8_t* kernel_ptr,
+                       const T* wscales_ptr,
+                       const T* ascales,
+                       const T* w_szs_ptr,
+                       const T* a_ssums,
+                       T* out_feats,
+                       cudaStream_t stream) {
+  auto in_feats = reinterpret_cast<const int8_t *>(in_feats_ptr);
+  auto kernel = reinterpret_cast<const int8_t *>(kernel_ptr);
+  using T2 = typename packed_as<T, 2>::type;
+  auto wscales = reinterpret_cast<const T2 *>(wscales_ptr);
+  auto w_szs = reinterpret_cast<const T2 *>(w_szs_ptr);
 
   constexpr int G = 128;
 
@@ -649,4 +651,50 @@ void gemm_forward_cuda(torch::Tensor _in_feats,
     KERNEL_LAUNCH_CODE
   }
   return ;
+}
+
+void gemm_forward_cuda(torch::Tensor _in_feats,
+                       torch::Tensor _kernel,
+                       torch::Tensor _wscales,
+                       torch::Tensor _ascales,
+                       torch::Tensor _w_szs,
+                       torch::Tensor _a_ssums,
+                       torch::Tensor _out_feats)
+{
+  int num_in_feats = _in_feats.size(0);
+  int num_in_channels = _in_feats.size(1);
+  auto in_feats = reinterpret_cast<int8_t *>(_in_feats.data_ptr<int8_t>());
+  auto kernel = reinterpret_cast<int8_t *>(_kernel.data_ptr<int8_t>());
+  int num_out_feats = _out_feats.size(-2);
+  int num_out_channels = _out_feats.size(-1);
+
+  bool result = false;
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (_wscales.scalar_type() == at::kHalf) {
+    using scalar_t = at::Half;
+    using T = typename FloatTypeConverter<scalar_t>::Type;
+    auto w_szs = reinterpret_cast<T *>(_w_szs.data_ptr<scalar_t>());
+    auto a_ssums = reinterpret_cast<T *>(_a_ssums.data_ptr<scalar_t>());
+    auto wscales = reinterpret_cast<T *>(_wscales.data_ptr<scalar_t>());
+    auto ascales = reinterpret_cast<T *>(_ascales.data_ptr<scalar_t>());
+    auto out_feats = reinterpret_cast<T *>(_out_feats.data_ptr<scalar_t>());
+    gemm_w4a8_per_chn<T>(
+        num_in_feats, num_in_channels, num_out_feats, num_out_channels,
+        in_feats, kernel, wscales, ascales,
+        w_szs, a_ssums, out_feats, stream);
+  } else if (_wscales.scalar_type() == at::kBFloat16) {
+#ifdef ENABLE_BF16
+    using scalar_t = at::BFloat16;
+    using T = typename FloatTypeConverter<scalar_t>::Type;
+    auto w_szs = reinterpret_cast<T *>(_w_szs.data_ptr<scalar_t>());
+    auto a_ssums = reinterpret_cast<T *>(_a_ssums.data_ptr<scalar_t>());
+    auto wscales = reinterpret_cast<T *>(_wscales.data_ptr<scalar_t>());
+    auto ascales = reinterpret_cast<T *>(_ascales.data_ptr<scalar_t>());
+    auto out_feats = reinterpret_cast<T *>(_out_feats.data_ptr<scalar_t>());
+    gemm_w4a8_per_chn<nv_bfloat16>(
+        num_in_feats, num_in_channels, num_out_feats, num_out_channels,
+        in_feats, kernel, wscales, ascales,
+        w_szs, a_ssums, out_feats, stream);
+#endif
+  }
 }

@@ -6,7 +6,17 @@
 #include <stdint.h>
 #include <float.h>
 #include <type_traits>
-#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <torch/all.h>
+#include <c10/cuda/CUDAGuard.h>
+#ifdef ENABLE_FP8
+#include "attention/dtype_fp8.cuh"
+#endif
+#if ENABLE_BF16
+#include <cuda_bf16.h>
+#endif
+
 
 template <typename T>
 struct FloatTypeConverter
@@ -467,3 +477,77 @@ __device__ inline __nv_bfloat162 cuda_abs(__nv_bfloat162 val)
 #endif
 
 #endif // ENABLE_FP16
+
+
+template <typename T>
+__device__ inline float to_float(T t);
+
+template <>
+__device__ inline float to_float<half>(half t) {
+  return __half2float(t);
+}
+
+template <>
+__device__ inline float to_float<float>(float t) {
+  return t;
+}
+
+template <typename T>
+__device__ inline T from_float(float t);// {
+//     assert(false);
+//     return {};
+// }
+
+template <>
+__device__ inline half from_float<half>(float t) {
+  return __float2half_rn(t);
+}
+
+template <>
+__device__ inline float from_float<float>(float t) {
+  return t;
+}
+
+template <typename T>
+__device__ inline float2 to_float2(T t);
+
+template <>
+__device__ inline float2 to_float2<half2>(half2 t) {
+  return __half22float2(t);
+}
+
+template <typename T>
+__device__ inline T from_float2(float2 t);
+
+template <>
+__device__ inline half2 from_float2<half2>(float2 t) {
+  return __float22half2_rn(t);
+}
+
+#if ENABLE_BF16
+template <>
+__device__ inline float to_float<nv_bfloat16>(nv_bfloat16 t) {
+  return __bfloat162float(t);
+}
+
+template <>
+__device__ inline nv_bfloat16 from_float<nv_bfloat16>(float t) {
+  return __float2bfloat16_rn(t);
+}
+
+template <>
+__device__ inline float2 to_float2<nv_bfloat162>(nv_bfloat162 t) {
+  return __bfloat1622float2(t);
+}
+
+template <>
+__device__ inline nv_bfloat162 from_float2<nv_bfloat162>(float2 t) {
+  return __float22bfloat162_rn(t);
+}
+#endif
+
+
+template <>
+__device__ inline float to_float(at::Half t) {
+  return __half2float(*reinterpret_cast<half*>(&t));
+}
