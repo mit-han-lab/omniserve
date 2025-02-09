@@ -190,7 +190,7 @@ class CacheEngine:
         key_cache_block = block_size * num_heads * head_size
         value_cache_block = key_cache_block
         total = num_layers * (key_cache_block + value_cache_block)
-        return cache_bit * total
+        return cache_bit * total // 8
 
 
 def _get_dtype_size(dtype: torch.dtype) -> int:

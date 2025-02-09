@@ -50,7 +50,7 @@ class EngineArgs:
     max_parallel_loading_workers: Optional[int] = None
     block_size: int = 64
     swap_space: int = 4  # GiB
-    gpu_memory_utilization: float = 0.90
+    gpu_memory_utilization: float = 0.75
     max_num_batched_tokens: int = 262144
     max_num_seqs: int = 256
     max_paddings: int = 256
