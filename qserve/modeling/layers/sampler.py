@@ -84,7 +84,7 @@ class Sampler(nn.Module):
             else:
                 last_token_logits = logits
         if (
-            self.sampling_params.temperature < 1e-5 or self.sampling_params.top_p < 1e-8 or sampling_params.top_k == 1 # greedy
+            self.sampling_params.temperature < 1e-5 or self.sampling_params.top_p < 1e-8 or self.sampling_params.top_k == 1 # greedy
         ):
             token = torch.argmax(last_token_logits, dim=-1)
         else:
