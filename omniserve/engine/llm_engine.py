@@ -444,7 +444,7 @@ class LLMEngine:
                 self.scheduler.free_seq(seqs[0])
                 request_outputs.append(
                     {
-                        "id": seqs[0].seq_id,
+                        "id": seq_group.request_id,
                         "text": seqs[0].output_text,
                         "finished": True,
                     }
@@ -453,7 +453,7 @@ class LLMEngine:
             else:
                 request_outputs.append(
                     {
-                        "id": seqs[0].seq_id,
+                        "id": seq_group.request_id,
                         "tokens": seqs[0].get_token_ids(),
                         "finished": False,
                     }
