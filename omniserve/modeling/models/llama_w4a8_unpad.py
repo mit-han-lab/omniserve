@@ -39,6 +39,7 @@ from torch import nn
 from transformers import LlamaConfig
 
 import omniserve.utils.constants
+from omniserve.utils.rope_utils import get_rope_scaling, get_rope_theta
 from omniserve.modeling.layers.activation import SiluAndMulQuant
 from omniserve.modeling.layers.layernorm import RMSNorm, RMSNormGeneral
 from omniserve.modeling.layers.quantized_linear import W4A8OF16LinearDynamicInputScale
@@ -147,8 +148,8 @@ class LlamaAttention(nn.Module):
         hidden_size = args.hidden_size
         num_heads = args.num_attention_heads
         num_kv_heads = args.num_key_value_heads
-        rope_theta = getattr(args, "rope_theta", 10000)
-        rope_scaling = getattr(args, "rope_scaling", None)
+        rope_theta = get_rope_theta(args)
+        rope_scaling = get_rope_scaling(args)
         max_position_embeddings = args.max_position_embeddings
 
         self.layer_idx = layer_idx
@@ -374,8 +375,8 @@ class LlamaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.use_int8 = True
         # Requires transformers > 4.32.0
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = get_rope_theta(config)
+        rope_scaling = get_rope_scaling(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = LlamaAttention(
             config,
