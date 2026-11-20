@@ -107,12 +107,10 @@ __global__ void quant_kernel_fuse_sum(const T *__restrict__ input,
 
   if constexpr (use_per_token_quant) {
     float amax_val = 0.0f;
-    float sum_val = 0.0f;
     const float zero = 0.0f;
 
     for (int i = tid; i < hidden_size; i += blockDim.x) {
       float val = (float)input[token_idx_mul_hidden_size + i];
-      sum_val += val;
       val = val > zero ? val : -val;
       if (val > amax_val)
         amax_val = val;
@@ -120,18 +118,22 @@ __global__ void quant_kernel_fuse_sum(const T *__restrict__ input,
 
     __shared__ float s_amax;
     const float block_amax_val = blockReduceMax(amax_val);
-    const float block_sum_val = blockReduceSum(sum_val);
     if (tid == 0) {
       s_amax = block_amax_val;
       scale[token_idx] = __float2half_rn(block_amax_val / 127.0f);
-      input_sum[token_idx] = __float2half_rn(block_sum_val);
     }
     __syncthreads();
 
     float tmp_scale = 127.0f / s_amax;
+    float code_sum_val = 0.0f;
     for (int i = tid; i < hidden_size; i += blockDim.x) {
-      output[token_idx_mul_hidden_size + i] =
-          float_to_int8_rn(((float)input[token_idx_mul_hidden_size + i]) * tmp_scale);
+      int8_t q = float_to_int8_rn(((float)input[token_idx_mul_hidden_size + i]) * tmp_scale);
+      output[token_idx_mul_hidden_size + i] = q;
+      code_sum_val += (float)q;
+    }
+    const float block_code_sum_val = blockReduceSum(code_sum_val);
+    if (tid == 0) {
+      input_sum[token_idx] = __float2half_rn(block_code_sum_val * (s_amax / 127.0f));
     }
   } else {
     for (int i = tid; i < hidden_size; i += blockDim.x) {

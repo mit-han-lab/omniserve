@@ -288,7 +288,6 @@ __global__ void generalLayerNorm_fuse_sum(const T* input, const T* gamma, const 
         if (with_per_token_scaling)
         {
             amax = cuda_max(cuda_max<T_scalar, T>(cuda_abs(val)), amax);
-            sum += cuda_sum<float>(val);
             if (use_shmem)
             {
                 shmem[i] = val;
@@ -308,8 +307,8 @@ __global__ void generalLayerNorm_fuse_sum(const T* input, const T* gamma, const 
     if (with_per_token_scaling)
     {
         float abs_max_f = blockAllReduceMax(cuda_cast<float>(amax));
-        float sum_f = blockAllReduceSum(cuda_cast<float>(sum));
         const float dynamic_per_token_scale = 127.f / abs_max_f;
+        float code_sum = 0.0f;
         for (int i = tidx; i < n_elems; i += blockDim.x)
         {
             const int index = bidx * n_elems + i;
@@ -319,13 +318,15 @@ __global__ void generalLayerNorm_fuse_sum(const T* input, const T* gamma, const 
                 val_f = compute_layernorm(val_f, s_mean, s_variance, gamma, beta, i);
             }
 
-            reinterpret_cast<int8_packed_t*>(normed_output_quant)[index]
-                = cuda_cast<int8_packed_t>(val_f * cuda_cast<float_packed_t>(dynamic_per_token_scale));
+            const int8_packed_t q = cuda_cast<int8_packed_t>(val_f * cuda_cast<float_packed_t>(dynamic_per_token_scale));
+            reinterpret_cast<int8_packed_t*>(normed_output_quant)[index] = q;
+            code_sum += cuda_sum<float>(cuda_cast<float_packed_t>(q));
         }
+        const float code_sum_f = blockAllReduceSum(code_sum);
         if (tidx == 0)
         {
             scale_orig_quant_per_token[bidx] = abs_max_f / 127.f;
-            input_sum[bidx] = sum_f;
+            input_sum[bidx] = code_sum_f * (abs_max_f / 127.f);
         }
     }
 }
